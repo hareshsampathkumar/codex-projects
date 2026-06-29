@@ -24,10 +24,23 @@ def env_required(name: str) -> str:
     return value
 
 
+def parse_accounts_json(raw: str):
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        compact = raw.replace("\r", "").replace("\n", "")
+        try:
+            return json.loads(compact)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "GMAIL_ACCOUNTS_JSON is not valid JSON. Check for missing quotes, commas, braces, or accidental line breaks inside token values."
+            ) from exc
+
+
 def account_configs():
     raw = os.environ.get("GMAIL_ACCOUNTS_JSON")
     if raw:
-        accounts = json.loads(raw)
+        accounts = parse_accounts_json(raw)
         if not isinstance(accounts, list) or not accounts:
             raise RuntimeError("GMAIL_ACCOUNTS_JSON must be a non-empty JSON list.")
         return accounts
