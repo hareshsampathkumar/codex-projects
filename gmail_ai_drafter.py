@@ -13,7 +13,8 @@ GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/gmail.compose",
 ]
-LABEL_NAME = "AI Drafted"
+DRAFTED_LABEL_NAME = "AI Drafted"
+REVIEWED_LABEL_NAME = "AI Reviewed"
 DEFAULT_MODEL = "gpt-4o-mini"
 
 
@@ -252,22 +253,32 @@ def apply_label(service, message_id, label_id):
     ).execute()
 
 
+def maybe_apply_label(service, message_id, label_id, dry_run):
+    if not dry_run:
+        apply_label(service, message_id, label_id)
+
+
 def process_account(config, client, model, dry_run, max_candidates):
     account_name = config.get("name", "unnamed")
     print(f"Processing Gmail account: {account_name}")
     service = gmail_service(config)
     service.users().getProfile(userId="me").execute()
 
-    label_id = ensure_label(service, LABEL_NAME)
+    drafted_label_id = ensure_label(service, DRAFTED_LABEL_NAME)
+    reviewed_label_id = ensure_label(service, REVIEWED_LABEL_NAME)
     draft_threads = existing_draft_thread_ids(service)
     voice_profile = build_voice_profile(service)
 
-    query = f'in:inbox is:unread -label:"{LABEL_NAME}" -in:spam -in:trash -category:promotions newer_than:14d'
+    query = (
+        f'in:inbox is:unread -label:"{DRAFTED_LABEL_NAME}" -label:"{REVIEWED_LABEL_NAME}" '
+        '-in:spam -in:trash -category:promotions newer_than:14d'
+    )
     candidates = list_messages(service, query, max_candidates)
     print(f"Unread candidates reviewed: {len(candidates)}")
 
     created = 0
-    labeled = 0
+    drafted = 0
+    reviewed = 0
     skipped = 0
 
     for candidate in candidates:
@@ -279,11 +290,15 @@ def process_account(config, client, model, dry_run, max_candidates):
 
         if thread_id in draft_threads:
             skipped += 1
+            maybe_apply_label(service, latest["id"], drafted_label_id, dry_run)
+            drafted += 1
             print("Skipped candidate with existing draft.")
             continue
         if sender_is_noise(from_header):
             skipped += 1
-            print("Skipped likely automated sender.")
+            maybe_apply_label(service, latest["id"], reviewed_label_id, dry_run)
+            reviewed += 1
+            print("Skipped likely automated sender and marked reviewed.")
             continue
 
         context = thread_context(service, thread_id)
@@ -309,7 +324,9 @@ def process_account(config, client, model, dry_run, max_candidates):
 
         if not draft.get("should_draft"):
             skipped += 1
-            print("Skipped candidate not classified as reply-worthy.")
+            maybe_apply_label(service, latest["id"], reviewed_label_id, dry_run)
+            reviewed += 1
+            print("Skipped candidate not classified as reply-worthy and marked reviewed.")
             continue
         if not draft.get("to") or not draft.get("subject") or not draft.get("body"):
             skipped += 1
@@ -322,10 +339,17 @@ def process_account(config, client, model, dry_run, max_candidates):
 
         create_reply_draft(service, latest, draft)
         created += 1
-        apply_label(service, latest["id"], label_id)
-        labeled += 1
+        apply_label(service, latest["id"], drafted_label_id)
+        drafted += 1
 
-    return {"account": account_name, "reviewed": len(candidates), "drafts_created": created, "labels_applied": labeled, "skipped": skipped}
+    return {
+        "account": account_name,
+        "reviewed": len(candidates),
+        "drafts_created": created,
+        "drafted_labels_applied": drafted,
+        "reviewed_labels_applied": reviewed,
+        "skipped": skipped,
+    }
 
 
 def main():
