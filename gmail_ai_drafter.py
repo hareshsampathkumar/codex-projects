@@ -7,14 +7,14 @@ from email.utils import parseaddr
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from openai import OpenAI
+from openai import AuthenticationError, OpenAI, RateLimitError
 
 GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/gmail.compose",
 ]
 LABEL_NAME = "AI Drafted"
-DEFAULT_MODEL = "gpt-4.1-mini"
+DEFAULT_MODEL = "gpt-4o-mini"
 
 
 def env_required(name: str) -> str:
@@ -253,7 +253,8 @@ def apply_label(service, message_id, label_id):
 
 
 def process_account(config, client, model, dry_run, max_candidates):
-    print(f"Processing Gmail account: {config.get('name', 'unnamed')}")
+    account_name = config.get("name", "unnamed")
+    print(f"Processing Gmail account: {account_name}")
     service = gmail_service(config)
     service.users().getProfile(userId="me").execute()
 
@@ -295,9 +296,15 @@ def process_account(config, client, model, dry_run, max_candidates):
         }
         try:
             draft = ask_openai(client, model, voice_profile, context, latest_headers)
-        except Exception:
+        except (AuthenticationError, RateLimitError) as exc:
+            message = str(exc).replace("\n", " ")[:500]
+            raise RuntimeError(
+                f"OpenAI draft generation failed for account {account_name}: {type(exc).__name__}: {message}"
+            ) from exc
+        except Exception as exc:
             skipped += 1
-            print("Skipped candidate due to draft generation error.")
+            message = str(exc).replace("\n", " ")[:500]
+            print(f"Skipped candidate due to draft generation error: {type(exc).__name__}: {message}")
             continue
 
         if not draft.get("should_draft"):
@@ -318,7 +325,7 @@ def process_account(config, client, model, dry_run, max_candidates):
         apply_label(service, latest["id"], label_id)
         labeled += 1
 
-    return {"account": config.get("name", "unnamed"), "reviewed": len(candidates), "drafts_created": created, "labels_applied": labeled, "skipped": skipped}
+    return {"account": account_name, "reviewed": len(candidates), "drafts_created": created, "labels_applied": labeled, "skipped": skipped}
 
 
 def main():
