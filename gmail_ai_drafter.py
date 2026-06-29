@@ -1,0 +1,311 @@
+import base64
+import json
+import os
+import re
+from email.message import EmailMessage
+from email.utils import getaddresses, parseaddr
+
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from openai import OpenAI
+
+GMAIL_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.compose",
+]
+LABEL_NAME = "AI Drafted"
+DEFAULT_MODEL = "gpt-4.1-mini"
+
+
+def env_required(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+def gmail_service():
+    creds = Credentials(
+        token=None,
+        refresh_token=env_required("GMAIL_REFRESH_TOKEN"),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=env_required("GMAIL_CLIENT_ID"),
+        client_secret=env_required("GMAIL_CLIENT_SECRET"),
+        scopes=GMAIL_SCOPES,
+    )
+    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+
+
+def header(headers, name, default=""):
+    for item in headers or []:
+        if item.get("name", "").lower() == name.lower():
+            return item.get("value", default)
+    return default
+
+
+def decode_part_body(part):
+    data = part.get("body", {}).get("data")
+    if not data:
+        return ""
+    return base64.urlsafe_b64decode(data.encode("utf-8")).decode("utf-8", errors="replace")
+
+
+def extract_text(payload):
+    if not payload:
+        return ""
+    mime_type = payload.get("mimeType", "")
+    if mime_type == "text/plain":
+        return decode_part_body(payload)
+    parts = payload.get("parts", [])
+    plain = []
+    html = []
+    for part in parts:
+        text = extract_text(part)
+        if part.get("mimeType") == "text/plain":
+            plain.append(text)
+        elif text:
+            html.append(text)
+    text = "\n".join(p for p in plain if p).strip() or "\n".join(h for h in html if h).strip()
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip() if "<" in text and ">" in text else text
+    return text
+
+
+def clean_for_prompt(text, limit=5000):
+    text = text or ""
+    text = re.split(r"\nOn .+ wrote:\n", text, maxsplit=1)[0]
+    text = re.split(r"\n-{2,} Forwarded message -{2,}\n", text, maxsplit=1)[0]
+    text = re.sub(r"This electronic message transmission, including any attachments,.*", "", text, flags=re.I | re.S)
+    text = text.strip()
+    return text[:limit]
+
+
+def list_messages(service, query, max_results=20):
+    response = service.users().messages().list(userId="me", q=query, maxResults=max_results).execute()
+    return response.get("messages", [])
+
+
+def get_message(service, message_id, fmt="full"):
+    return service.users().messages().get(userId="me", id=message_id, format=fmt).execute()
+
+
+def get_thread(service, thread_id):
+    return service.users().threads().get(userId="me", id=thread_id, format="full").execute()
+
+
+def ensure_label(service, name):
+    labels = service.users().labels().list(userId="me").execute().get("labels", [])
+    for label in labels:
+        if label.get("name") == name:
+            return label["id"]
+    created = service.users().labels().create(
+        userId="me",
+        body={
+            "name": name,
+            "labelListVisibility": "labelShowIfUnread",
+            "messageListVisibility": "show",
+        },
+    ).execute()
+    return created["id"]
+
+
+def existing_draft_thread_ids(service):
+    result = service.users().drafts().list(userId="me", maxResults=100).execute()
+    ids = set()
+    for draft in result.get("drafts", []):
+        msg = draft.get("message", {})
+        if msg.get("threadId"):
+            ids.add(msg["threadId"])
+    return ids
+
+
+def sender_is_noise(from_header):
+    email = parseaddr(from_header)[1].lower()
+    local = email.split("@", 1)[0]
+    return (
+        local in {"no-reply", "noreply", "donotreply", "do-not-reply", "notifications", "notification"}
+        or "mailer-daemon" in email
+    )
+
+
+def build_voice_profile(service):
+    sent = list_messages(service, "in:sent newer_than:90d -in:trash -in:spam", 20)
+    examples = []
+    for msg in sent[:10]:
+        full = get_message(service, msg["id"])
+        headers = full.get("payload", {}).get("headers", [])
+        body = clean_for_prompt(extract_text(full.get("payload", {})), 1200)
+        if body:
+            examples.append(
+                {
+                    "to": header(headers, "To"),
+                    "subject": header(headers, "Subject"),
+                    "body": body,
+                }
+            )
+    return examples
+
+
+def thread_context(service, thread_id):
+    thread = get_thread(service, thread_id)
+    items = []
+    for msg in thread.get("messages", [])[-6:]:
+        payload = msg.get("payload", {})
+        headers = payload.get("headers", [])
+        items.append(
+            {
+                "id": msg.get("id"),
+                "from": header(headers, "From"),
+                "to": header(headers, "To"),
+                "cc": header(headers, "Cc"),
+                "date": header(headers, "Date"),
+                "subject": header(headers, "Subject"),
+                "message_id": header(headers, "Message-ID"),
+                "references": header(headers, "References"),
+                "body": clean_for_prompt(extract_text(payload), 3000),
+            }
+        )
+    return items
+
+
+def ask_openai(client, model, profile, context, latest_headers):
+    system = """You draft email replies for Haresh Sampathkumar.
+Return strict JSON only with keys: should_draft, to, cc, subject, body, reason.
+Never send. Draft only if the latest email is reply-worthy.
+Skip newsletters, marketing, automated notifications, FYI-only updates, receipts, calendar/system mail, no-reply mail, and unclear mass emails.
+Voice: direct, concise, practical, authoritative but polite. Often use the person's name for substantive replies. Put the answer/instruction first. Use short paragraphs. For quick internal acknowledgments, no formal signature is needed. For substantive professional replies, use "Best," and Haresh when it fits. Do not invent facts or commitments. If key facts are missing, ask a compact clarifying question.
+"""
+    user = {
+        "style_examples": profile,
+        "latest_message_headers": latest_headers,
+        "thread_context_recent_first_is_last": context,
+    }
+    response = client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+        ],
+    )
+    text = response.output_text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.S)
+    return json.loads(text)
+
+
+def create_reply_draft(service, latest_message, draft):
+    payload = latest_message.get("payload", {})
+    headers = payload.get("headers", [])
+    original_message_id = header(headers, "Message-ID")
+    original_references = header(headers, "References")
+
+    msg = EmailMessage()
+    msg["To"] = draft["to"]
+    if draft.get("cc"):
+        msg["Cc"] = draft["cc"]
+    msg["Subject"] = draft["subject"]
+    if original_message_id:
+        msg["In-Reply-To"] = original_message_id
+        msg["References"] = (original_references + " " + original_message_id).strip()
+    msg.set_content(draft["body"])
+
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+    return service.users().drafts().create(
+        userId="me",
+        body={"message": {"raw": raw, "threadId": latest_message["threadId"]}},
+    ).execute()
+
+
+def apply_label(service, message_id, label_id):
+    service.users().messages().modify(
+        userId="me",
+        id=message_id,
+        body={"addLabelIds": [label_id], "removeLabelIds": []},
+    ).execute()
+
+
+def main():
+    dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
+    max_candidates = int(os.environ.get("GMAIL_MAX_CANDIDATES", "20"))
+    model = os.environ.get("OPENAI_MODEL", DEFAULT_MODEL)
+
+    service = gmail_service()
+    profile = service.users().getProfile(userId="me").execute()
+    print(f"Connected Gmail account: {profile.get('emailAddress')}")
+
+    label_id = ensure_label(service, LABEL_NAME)
+    draft_threads = existing_draft_thread_ids(service)
+    voice_profile = build_voice_profile(service)
+
+    query = f'in:inbox is:unread -label:"{LABEL_NAME}" -in:spam -in:trash -category:promotions newer_than:14d'
+    candidates = list_messages(service, query, max_candidates)
+    print(f"Unread candidates reviewed: {len(candidates)}")
+
+    client = OpenAI(api_key=env_required("OPENAI_API_KEY"))
+    created = 0
+    labeled = 0
+    skipped = 0
+
+    for candidate in candidates:
+        latest = get_message(service, candidate["id"])
+        thread_id = latest.get("threadId")
+        payload = latest.get("payload", {})
+        headers = payload.get("headers", [])
+        from_header = header(headers, "From")
+        subject = header(headers, "Subject")
+
+        if thread_id in draft_threads:
+            skipped += 1
+            print(f"skip existing draft: {subject}")
+            continue
+        if sender_is_noise(from_header):
+            skipped += 1
+            print(f"skip noise sender: {from_header}")
+            continue
+
+        context = thread_context(service, thread_id)
+        latest_headers = {
+            "from": from_header,
+            "to": header(headers, "To"),
+            "cc": header(headers, "Cc"),
+            "subject": subject,
+            "date": header(headers, "Date"),
+        }
+        try:
+            draft = ask_openai(client, model, voice_profile, context, latest_headers)
+        except Exception as exc:
+            skipped += 1
+            print(f"skip model error for {subject}: {exc}")
+            continue
+
+        if not draft.get("should_draft"):
+            skipped += 1
+            print(f"skip not reply-worthy: {subject} ({draft.get('reason', '')})")
+            continue
+
+        if not draft.get("to") or not draft.get("subject") or not draft.get("body"):
+            skipped += 1
+            print(f"skip incomplete draft: {subject}")
+            continue
+
+        print(f"draft: {subject} -> {draft.get('to')}")
+        if dry_run:
+            continue
+
+        create_reply_draft(service, latest, draft)
+        created += 1
+        apply_label(service, latest["id"], label_id)
+        labeled += 1
+
+    print(json.dumps({
+        "account": profile.get("emailAddress"),
+        "reviewed": len(candidates),
+        "drafts_created": created,
+        "labels_applied": labeled,
+        "skipped": skipped,
+        "dry_run": dry_run,
+    }))
+
+
+if __name__ == "__main__":
+    main()
