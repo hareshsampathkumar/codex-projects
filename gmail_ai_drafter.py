@@ -24,13 +24,30 @@ def env_required(name: str) -> str:
     return value
 
 
-def gmail_service():
+def account_configs():
+    raw = os.environ.get("GMAIL_ACCOUNTS_JSON")
+    if raw:
+        accounts = json.loads(raw)
+        if not isinstance(accounts, list) or not accounts:
+            raise RuntimeError("GMAIL_ACCOUNTS_JSON must be a non-empty JSON list.")
+        return accounts
+    return [
+        {
+            "name": "default",
+            "client_id": env_required("GMAIL_CLIENT_ID"),
+            "client_secret": env_required("GMAIL_CLIENT_SECRET"),
+            "refresh_token": env_required("GMAIL_REFRESH_TOKEN"),
+        }
+    ]
+
+
+def gmail_service(config):
     creds = Credentials(
         token=None,
-        refresh_token=env_required("GMAIL_REFRESH_TOKEN"),
+        refresh_token=config["refresh_token"],
         token_uri="https://oauth2.googleapis.com/token",
-        client_id=env_required("GMAIL_CLIENT_ID"),
-        client_secret=env_required("GMAIL_CLIENT_SECRET"),
+        client_id=config["client_id"],
+        client_secret=config["client_secret"],
         scopes=GMAIL_SCOPES,
     )
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
@@ -53,13 +70,11 @@ def decode_part_body(part):
 def extract_text(payload):
     if not payload:
         return ""
-    mime_type = payload.get("mimeType", "")
-    if mime_type == "text/plain":
+    if payload.get("mimeType") == "text/plain":
         return decode_part_body(payload)
-    parts = payload.get("parts", [])
     plain = []
     html = []
-    for part in parts:
+    for part in payload.get("parts", []):
         text = extract_text(part)
         if part.get("mimeType") == "text/plain":
             plain.append(text)
@@ -76,8 +91,7 @@ def clean_for_prompt(text, limit=5000):
     text = re.split(r"\nOn .+ wrote:\n", text, maxsplit=1)[0]
     text = re.split(r"\n-{2,} Forwarded message -{2,}\n", text, maxsplit=1)[0]
     text = re.sub(r"This electronic message transmission, including any attachments,.*", "", text, flags=re.I | re.S)
-    text = text.strip()
-    return text[:limit]
+    return text.strip()[:limit]
 
 
 def list_messages(service, query, max_results=20):
@@ -113,9 +127,9 @@ def existing_draft_thread_ids(service):
     result = service.users().drafts().list(userId="me", maxResults=100).execute()
     ids = set()
     for draft in result.get("drafts", []):
-        msg = draft.get("message", {})
-        if msg.get("threadId"):
-            ids.add(msg["threadId"])
+        thread_id = draft.get("message", {}).get("threadId")
+        if thread_id:
+            ids.add(thread_id)
     return ids
 
 
@@ -136,13 +150,7 @@ def build_voice_profile(service):
         headers = full.get("payload", {}).get("headers", [])
         body = clean_for_prompt(extract_text(full.get("payload", {})), 1200)
         if body:
-            examples.append(
-                {
-                    "to": header(headers, "To"),
-                    "subject": header(headers, "Subject"),
-                    "body": body,
-                }
-            )
+            examples.append({"to": header(headers, "To"), "subject": header(headers, "Subject"), "body": body})
     return examples
 
 
@@ -175,17 +183,10 @@ Never send. Draft only if the latest email is reply-worthy.
 Skip newsletters, marketing, automated notifications, FYI-only updates, receipts, calendar/system mail, no-reply mail, and unclear mass emails.
 Voice: direct, concise, practical, authoritative but polite. Often use the person's name for substantive replies. Put the answer/instruction first. Use short paragraphs. For quick internal acknowledgments, no formal signature is needed. For substantive professional replies, use "Best," and Haresh when it fits. Do not invent facts or commitments. If key facts are missing, ask a compact clarifying question.
 """
-    user = {
-        "style_examples": profile,
-        "latest_message_headers": latest_headers,
-        "thread_context_recent_first_is_last": context,
-    }
+    user = {"style_examples": profile, "latest_message_headers": latest_headers, "thread_context_recent_first_is_last": context}
     response = client.responses.create(
         model=model,
-        input=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
-        ],
+        input=[{"role": "system", "content": system}, {"role": "user", "content": json.dumps(user, ensure_ascii=False)}],
     )
     text = response.output_text.strip()
     if text.startswith("```"):
@@ -194,8 +195,7 @@ Voice: direct, concise, practical, authoritative but polite. Often use the perso
 
 
 def create_reply_draft(service, latest_message, draft):
-    payload = latest_message.get("payload", {})
-    headers = payload.get("headers", [])
+    headers = latest_message.get("payload", {}).get("headers", [])
     original_message_id = header(headers, "Message-ID")
     original_references = header(headers, "References")
 
@@ -224,14 +224,10 @@ def apply_label(service, message_id, label_id):
     ).execute()
 
 
-def main():
-    dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
-    max_candidates = int(os.environ.get("GMAIL_MAX_CANDIDATES", "20"))
-    model = os.environ.get("OPENAI_MODEL", DEFAULT_MODEL)
-
-    service = gmail_service()
+def process_account(config, client, model, dry_run, max_candidates):
+    service = gmail_service(config)
     service.users().getProfile(userId="me").execute()
-    print("Connected Gmail account verified.")
+    print(f"Processing Gmail account: {config.get('name', 'unnamed')}")
 
     label_id = ensure_label(service, LABEL_NAME)
     draft_threads = existing_draft_thread_ids(service)
@@ -241,7 +237,6 @@ def main():
     candidates = list_messages(service, query, max_candidates)
     print(f"Unread candidates reviewed: {len(candidates)}")
 
-    client = OpenAI(api_key=env_required("OPENAI_API_KEY"))
     created = 0
     labeled = 0
     skipped = 0
@@ -249,8 +244,7 @@ def main():
     for candidate in candidates:
         latest = get_message(service, candidate["id"])
         thread_id = latest.get("threadId")
-        payload = latest.get("payload", {})
-        headers = payload.get("headers", [])
+        headers = latest.get("payload", {}).get("headers", [])
         from_header = header(headers, "From")
         subject = header(headers, "Subject")
 
@@ -282,7 +276,6 @@ def main():
             skipped += 1
             print("Skipped candidate not classified as reply-worthy.")
             continue
-
         if not draft.get("to") or not draft.get("subject") or not draft.get("body"):
             skipped += 1
             print("Skipped incomplete draft response.")
@@ -297,13 +290,17 @@ def main():
         apply_label(service, latest["id"], label_id)
         labeled += 1
 
-    print(json.dumps({
-        "reviewed": len(candidates),
-        "drafts_created": created,
-        "labels_applied": labeled,
-        "skipped": skipped,
-        "dry_run": dry_run,
-    }))
+    return {"account": config.get("name", "unnamed"), "reviewed": len(candidates), "drafts_created": created, "labels_applied": labeled, "skipped": skipped}
+
+
+def main():
+    dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
+    max_candidates = int(os.environ.get("GMAIL_MAX_CANDIDATES", "20"))
+    model = os.environ.get("OPENAI_MODEL", DEFAULT_MODEL)
+    client = OpenAI(api_key=env_required("OPENAI_API_KEY"))
+
+    results = [process_account(config, client, model, dry_run, max_candidates) for config in account_configs()]
+    print(json.dumps({"accounts": results, "dry_run": dry_run}))
 
 
 if __name__ == "__main__":
