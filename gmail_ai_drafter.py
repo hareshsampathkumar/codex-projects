@@ -3,7 +3,7 @@ import json
 import os
 import re
 from email.message import EmailMessage
-from email.utils import getaddresses, parseaddr
+from email.utils import parseaddr
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -230,8 +230,8 @@ def main():
     model = os.environ.get("OPENAI_MODEL", DEFAULT_MODEL)
 
     service = gmail_service()
-    profile = service.users().getProfile(userId="me").execute()
-    print(f"Connected Gmail account: {profile.get('emailAddress')}")
+    service.users().getProfile(userId="me").execute()
+    print("Connected Gmail account verified.")
 
     label_id = ensure_label(service, LABEL_NAME)
     draft_threads = existing_draft_thread_ids(service)
@@ -256,11 +256,11 @@ def main():
 
         if thread_id in draft_threads:
             skipped += 1
-            print(f"skip existing draft: {subject}")
+            print("Skipped candidate with existing draft.")
             continue
         if sender_is_noise(from_header):
             skipped += 1
-            print(f"skip noise sender: {from_header}")
+            print("Skipped likely automated sender.")
             continue
 
         context = thread_context(service, thread_id)
@@ -273,22 +273,22 @@ def main():
         }
         try:
             draft = ask_openai(client, model, voice_profile, context, latest_headers)
-        except Exception as exc:
+        except Exception:
             skipped += 1
-            print(f"skip model error for {subject}: {exc}")
+            print("Skipped candidate due to draft generation error.")
             continue
 
         if not draft.get("should_draft"):
             skipped += 1
-            print(f"skip not reply-worthy: {subject} ({draft.get('reason', '')})")
+            print("Skipped candidate not classified as reply-worthy.")
             continue
 
         if not draft.get("to") or not draft.get("subject") or not draft.get("body"):
             skipped += 1
-            print(f"skip incomplete draft: {subject}")
+            print("Skipped incomplete draft response.")
             continue
 
-        print(f"draft: {subject} -> {draft.get('to')}")
+        print("Creating Gmail draft reply.")
         if dry_run:
             continue
 
@@ -298,7 +298,6 @@ def main():
         labeled += 1
 
     print(json.dumps({
-        "account": profile.get("emailAddress"),
         "reviewed": len(candidates),
         "drafts_created": created,
         "labels_applied": labeled,
