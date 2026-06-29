@@ -38,4 +38,25 @@ jobs:
           GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
           GMAIL_MAX_CANDIDATES: ${{ vars.GMAIL_MAX_CANDIDATES || '20' }}
           DRY_RUN: ${{ vars.DRY_RUN || secrets.DRY_RUN || 'false' }}
-        run: python gmail_ai_drafter.py
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('gmail_ai_drafter.py')
+          text = path.read_text()
+          old = '''        except Exception:
+            skipped += 1
+            print("Skipped candidate due to draft generation error.")
+            continue
+'''
+          new = '''        except Exception as exc:
+            skipped += 1
+            message = str(exc).replace("\\n", " ")[:500]
+            print(f"Skipped candidate due to draft generation error: {type(exc).__name__}: {message}")
+            continue
+'''
+          if old not in text:
+              raise SystemExit('Could not patch draft-generation error logging block.')
+          path.write_text(text.replace(old, new))
+          PY
+          python gmail_ai_drafter.py
