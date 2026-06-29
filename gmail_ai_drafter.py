@@ -37,20 +37,35 @@ def parse_accounts_json(raw: str):
             ) from exc
 
 
+def normalize_account(config):
+    normalized = dict(config)
+    for key in ("client_id", "client_secret", "refresh_token"):
+        if key not in normalized or not normalized[key]:
+            raise RuntimeError(f"GMAIL_ACCOUNTS_JSON account {normalized.get('name', 'unnamed')} is missing {key}.")
+        value = str(normalized[key]).strip()
+        if key == "refresh_token":
+            value = re.sub(r"\s+", "", value)
+        normalized[key] = value
+    normalized["name"] = str(normalized.get("name", "unnamed")).strip() or "unnamed"
+    return normalized
+
+
 def account_configs():
     raw = os.environ.get("GMAIL_ACCOUNTS_JSON")
     if raw:
         accounts = parse_accounts_json(raw)
         if not isinstance(accounts, list) or not accounts:
             raise RuntimeError("GMAIL_ACCOUNTS_JSON must be a non-empty JSON list.")
-        return accounts
+        return [normalize_account(account) for account in accounts]
     return [
-        {
-            "name": "default",
-            "client_id": env_required("GMAIL_CLIENT_ID"),
-            "client_secret": env_required("GMAIL_CLIENT_SECRET"),
-            "refresh_token": env_required("GMAIL_REFRESH_TOKEN"),
-        }
+        normalize_account(
+            {
+                "name": "default",
+                "client_id": env_required("GMAIL_CLIENT_ID"),
+                "client_secret": env_required("GMAIL_CLIENT_SECRET"),
+                "refresh_token": env_required("GMAIL_REFRESH_TOKEN"),
+            }
+        )
     ]
 
 
@@ -238,9 +253,9 @@ def apply_label(service, message_id, label_id):
 
 
 def process_account(config, client, model, dry_run, max_candidates):
+    print(f"Processing Gmail account: {config.get('name', 'unnamed')}")
     service = gmail_service(config)
     service.users().getProfile(userId="me").execute()
-    print(f"Processing Gmail account: {config.get('name', 'unnamed')}")
 
     label_id = ensure_label(service, LABEL_NAME)
     draft_threads = existing_draft_thread_ids(service)
